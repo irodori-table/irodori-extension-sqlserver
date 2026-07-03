@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "extensionId": "irodori.sqlserver",
   "visibility": "public",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "connector": {
     "id": "sqlserver.connector",
     "engine": "sqlserver",
@@ -60,6 +60,7 @@
       "windowsIntegrated",
       "azureAd",
       "servicePrincipal",
+      "servicePrincipalCertificate",
       "managedIdentity",
       "accessToken",
       "customDriverOptions"

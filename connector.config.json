@@ -249,6 +249,47 @@
           ]
         },
         {
+          "id": "servicePrincipalCertificate",
+          "label": "Service principal certificate",
+          "kind": "oauth2",
+          "secretPurposes": [
+            "privateKey",
+            "privateKeyPassphrase"
+          ],
+          "fields": [
+            {
+              "id": "clientId",
+              "label": "Client ID",
+              "type": "string",
+              "required": true
+            },
+            {
+              "id": "tenantId",
+              "label": "Tenant ID",
+              "type": "string",
+              "required": true
+            },
+            {
+              "id": "clientCertificate",
+              "label": "Client certificate",
+              "type": "pem"
+            },
+            {
+              "id": "clientPrivateKey",
+              "label": "Client private key",
+              "type": "pem",
+              "secretPurpose": "privateKey",
+              "required": true
+            },
+            {
+              "id": "clientPrivateKeyPassphrase",
+              "label": "Private key passphrase",
+              "type": "secret",
+              "secretPurpose": "privateKeyPassphrase"
+            }
+          ]
+        },
+        {
           "id": "managedIdentity",
           "label": "Managed identity",
           "kind": "managedIdentity",
@@ -696,6 +737,47 @@
             "id": "tenantId",
             "label": "Tenant ID",
             "type": "string"
+          }
+        ]
+      },
+      {
+        "id": "servicePrincipalCertificate",
+        "label": "Service principal certificate",
+        "kind": "oauth2",
+        "secretPurposes": [
+          "privateKey",
+          "privateKeyPassphrase"
+        ],
+        "fields": [
+          {
+            "id": "clientId",
+            "label": "Client ID",
+            "type": "string",
+            "required": true
+          },
+          {
+            "id": "tenantId",
+            "label": "Tenant ID",
+            "type": "string",
+            "required": true
+          },
+          {
+            "id": "clientCertificate",
+            "label": "Client certificate",
+            "type": "pem"
+          },
+          {
+            "id": "clientPrivateKey",
+            "label": "Client private key",
+            "type": "pem",
+            "secretPurpose": "privateKey",
+            "required": true
+          },
+          {
+            "id": "clientPrivateKeyPassphrase",
+            "label": "Private key passphrase",
+            "type": "secret",
+            "secretPurpose": "privateKeyPassphrase"
           }
         ]
       },

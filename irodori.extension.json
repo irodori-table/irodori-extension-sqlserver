@@ -3,7 +3,7 @@
   "manifestVersion": 1,
   "id": "irodori.sqlserver",
   "name": "SQL Server Connector",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "irodori",
   "description": "SQL Server Connector contributes the SQL Server database connector through the native connector ABI.",
   "license": "MIT OR 0BSD",
@@ -264,6 +264,47 @@
                   "id": "tenantId",
                   "label": "Tenant ID",
                   "type": "string"
+                }
+              ]
+            },
+            {
+              "id": "servicePrincipalCertificate",
+              "label": "Service principal certificate",
+              "kind": "oauth2",
+              "secretPurposes": [
+                "privateKey",
+                "privateKeyPassphrase"
+              ],
+              "fields": [
+                {
+                  "id": "clientId",
+                  "label": "Client ID",
+                  "type": "string",
+                  "required": true
+                },
+                {
+                  "id": "tenantId",
+                  "label": "Tenant ID",
+                  "type": "string",
+                  "required": true
+                },
+                {
+                  "id": "clientCertificate",
+                  "label": "Client certificate",
+                  "type": "pem"
+                },
+                {
+                  "id": "clientPrivateKey",
+                  "label": "Client private key",
+                  "type": "pem",
+                  "secretPurpose": "privateKey",
+                  "required": true
+                },
+                {
+                  "id": "clientPrivateKeyPassphrase",
+                  "label": "Private key passphrase",
+                  "type": "secret",
+                  "secretPurpose": "privateKeyPassphrase"
                 }
               ]
             },
