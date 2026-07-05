@@ -2,7 +2,7 @@
 name = "irodori-extension-sqlserver"
 version = "0.1.2"
 edition = "2021"
-license = "MIT OR 0BSD"
+license = "0BSD"
 description = "Native Irodori Table connector extension for SQL Server."
 repository = "https://github.com/hjosugi/irodori-extension-sqlserver"
 readme = "README.md"
