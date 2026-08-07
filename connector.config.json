@@ -422,7 +422,7 @@
   },
   "source": {
     "marketplaceId": "irodori.sqlserver",
-    "repository": "https://github.com/hjosugi/irodori-extension-sqlserver",
+    "repository": "https://github.com/irodori-table/irodori-extension-sqlserver",
     "knowledgeEngineStatus": "verified",
     "adapter": "db/mssql.rs",
     "adapterSha256": "8067c4be01ddb0b5de02477da6c74a2bfde1f4ea513b7e41277070b845f7938b",
