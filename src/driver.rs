@@ -32,6 +32,9 @@ struct SqlServerConfig {
     database: Option<String>,
     user: Option<String>,
     password: Option<String>,
+    /// A Microsoft Entra (Azure AD) access token, when the profile supplies one
+    /// instead of a SQL login.
+    access_token: Option<String>,
     redaction_values: Vec<String>,
 }
 
@@ -242,7 +245,21 @@ impl SqlServerConfig {
         let database = option_string(request, &["database", "db"]);
         let user = option_string(request, &["user", "username", "uid"]);
         let password = option_string(request, &["password", "pwd", "token"]);
+        // Every Entra path — interactive login, a service principal, a managed
+        // identity — ends in a token. Accepting the token itself is the part
+        // this connector can honour without an Azure identity client.
+        let access_token = option_string(
+            request,
+            &[
+                "accessToken",
+                "aadToken",
+                "azureAccessToken",
+                "entraToken",
+                "token",
+            ],
+        );
         let mut redaction_values = Vec::new();
+        push_sensitive(&mut redaction_values, access_token.as_deref());
         push_sensitive(&mut redaction_values, password.as_deref());
         collect_ado_secrets(ado.as_deref().unwrap_or_default(), &mut redaction_values);
         Ok(Self {
@@ -252,6 +269,7 @@ impl SqlServerConfig {
             database,
             user,
             password,
+            access_token,
             redaction_values,
         })
     }
@@ -263,10 +281,17 @@ impl SqlServerConfig {
             let mut config = Config::new();
             config.host(&self.host);
             config.port(self.port);
-            config.authentication(AuthMethod::sql_server(
-                self.user.clone().unwrap_or_default(),
-                self.password.clone().unwrap_or_default(),
-            ));
+            // An Entra token identifies a user or service principal that SQL
+            // Server trusts directly, so it replaces the SQL login rather than
+            // supplementing it. Preferred when present: supplying both and
+            // silently using the password would authenticate as somebody else.
+            match self.access_token.as_deref() {
+                Some(token) => config.authentication(AuthMethod::AADToken(token.to_string())),
+                None => config.authentication(AuthMethod::sql_server(
+                    self.user.clone().unwrap_or_default(),
+                    self.password.clone().unwrap_or_default(),
+                )),
+            }
             if let Some(database) = self.database.as_deref() {
                 config.database(database);
             }
@@ -277,19 +302,24 @@ impl SqlServerConfig {
     }
 
     fn redact(&self, message: &str) -> String {
-        self.redaction_values.iter().fold(
-            message.replace(
-                self.ado.as_deref().unwrap_or_default(),
-                "<sqlserver-connection>",
-            ),
-            |message, secret| {
+        // `str::replace` with an empty needle inserts the replacement between
+        // every character, so a profile configured by host and port — which has
+        // no ADO string — turned every error message into
+        // `<sqlserver-connection>l<sqlserver-connection>o…`. The loop below
+        // already guarded against an empty secret; this one was missed.
+        let message = match self.ado.as_deref().filter(|ado| !ado.is_empty()) {
+            Some(ado) => message.replace(ado, "<sqlserver-connection>"),
+            None => message.to_string(),
+        };
+        self.redaction_values
+            .iter()
+            .fold(message, |message, secret| {
                 if secret.is_empty() {
                     message
                 } else {
                     message.replace(secret, "****")
                 }
-            },
-        )
+            })
     }
 }
 
@@ -679,5 +709,64 @@ mod tests {
         assert_eq!(config.port, 1434);
         assert_eq!(config.database.as_deref(), Some("app"));
         assert_eq!(config.user.as_deref(), Some("sa"));
+    }
+
+    #[test]
+    fn reads_an_entra_access_token_under_its_usual_names() {
+        for field in ["accessToken", "aadToken", "azureAccessToken", "entraToken"] {
+            let config = SqlServerConfig::from_request(&json!({
+                "profile": { "host": "sql.local", "options": { field: "eyJ0oken" } }
+            }))
+            .expect("config");
+            assert_eq!(config.access_token.as_deref(), Some("eyJ0oken"), "{field}");
+        }
+    }
+
+    #[test]
+    fn a_sql_login_profile_carries_no_token() {
+        let config = SqlServerConfig::from_request(&json!({
+            "profile": { "host": "sql.local", "user": "sa", "password": "pw" }
+        }))
+        .expect("config");
+        assert_eq!(config.access_token, None);
+        assert_eq!(config.password.as_deref(), Some("pw"));
+    }
+
+    #[test]
+    fn the_token_is_redacted_from_errors() {
+        // A token in a connection error would otherwise reach the log the user
+        // pastes into an issue.
+        let config = SqlServerConfig::from_request(&json!({
+            "profile": { "host": "sql.local", "options": { "accessToken": "eyJ0oken" } }
+        }))
+        .expect("config");
+        assert_eq!(
+            config.redact("login failed for eyJ0oken"),
+            "login failed for ****"
+        );
+    }
+
+    #[test]
+    fn a_profile_without_an_ado_string_does_not_mangle_the_message() {
+        // Regression: `str::replace` with an empty needle inserts the
+        // replacement between every character, so every error from a
+        // host-and-port profile came back as
+        // `<sqlserver-connection>l<sqlserver-connection>o…`.
+        let config = SqlServerConfig::from_request(&json!({
+            "profile": { "host": "sql.local", "user": "sa", "password": "pw" }
+        }))
+        .expect("config");
+        assert_eq!(config.redact("login failed"), "login failed");
+    }
+
+    #[test]
+    fn an_ado_string_is_still_replaced() {
+        let config = SqlServerConfig::from_request(&json!({
+            "profile": { "options": { "connectionString": "Server=sql.local;User Id=sa;Password=pw" } }
+        }))
+        .expect("config");
+        let redacted = config.redact("cannot open Server=sql.local;User Id=sa;Password=pw");
+        assert!(redacted.contains("<sqlserver-connection>"), "{redacted}");
+        assert!(!redacted.contains("Password=pw"), "{redacted}");
     }
 }
