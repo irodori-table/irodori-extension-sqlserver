@@ -24,9 +24,13 @@ name = "irodori_extension_sqlserver"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-irodori-connector-abi = { git = "https://github.com/irodori-table/irodori-kit", tag = "v0.8.1" }
+irodori-connector-abi = { git = "https://github.com/irodori-table/irodori-kit", tag = "v0.8.3" }
 futures-util = "0.3"
 serde_json = "1"
+# Entra tokens are fetched over HTTPS. rustls to match the rest of the
+# fleet; tiberius keeps native-tls for the TDS connection itself, so the
+# binary carries both stacks -- tracked separately.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tiberius = { version = "0.12", default-features = false, features = ["tds73", "chrono", "native-tls"] }
 tokio = { version = "1", features = ["net", "rt-multi-thread"] }
 tokio-util = { version = "0.7", features = ["compat"] }
