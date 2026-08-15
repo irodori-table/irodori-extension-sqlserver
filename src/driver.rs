@@ -1,11 +1,11 @@
-use irodori_connector_abi::{option_string, push_sensitive};
+use irodori_connector_abi::{option_bool, option_string, push_sensitive};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use futures_util::TryStreamExt;
 use serde_json::{json, Map, Value};
 use tiberius::time::chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
-use tiberius::{AuthMethod, Client, ColumnData, Config, FromSql, QueryItem};
+use tiberius::{AuthMethod, Client, ColumnData, Config, EncryptionLevel, FromSql, QueryItem};
 use tokio::net::TcpStream;
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex as AsyncMutex;
@@ -36,6 +36,7 @@ struct SqlServerConfig {
     /// A Microsoft Entra (Azure AD) access token, when the profile supplies one
     /// instead of a SQL login.
     access_token: Option<String>,
+    tls: TlsTrust,
     redaction_values: Vec<String>,
 }
 
@@ -235,6 +236,127 @@ impl SqlServerConnection {
     }
 }
 
+/// How much the connector should believe the server it reaches.
+///
+/// This exists because the connector previously called `trust_cert()`
+/// unconditionally: every connection accepted any certificate, and there was no
+/// way to ask for verification. That matters more here than in most connectors
+/// because an Entra access token is replayable — whoever terminates the TLS
+/// session gets a credential that works against the real database.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct TlsTrust {
+    /// A CA file to verify against, for a private or internal certificate
+    /// authority. Verification stays on.
+    ca_path: Option<String>,
+    /// Explicitly accept any certificate. Named the same as everywhere else in
+    /// the fleet so a user who knows one connector knows this one.
+    accept_invalid_certs: bool,
+    /// `None` leaves tiberius on its own default, which is
+    /// `EncryptionLevel::Required` on a TLS-enabled build.
+    encryption: Option<EncryptionLevel>,
+}
+
+impl TlsTrust {
+    fn from_request(request: &Value) -> Self {
+        Self {
+            ca_path: option_string(
+                request,
+                &[
+                    "sslRootCert",
+                    "tlsCaCertificate",
+                    "caCertificate",
+                    "trustServerCertificateCa",
+                ],
+            ),
+            accept_invalid_certs: option_bool(
+                request,
+                &[
+                    "sslInsecure",
+                    "tlsInsecure",
+                    "trustServerCertificate",
+                    "acceptInvalidCerts",
+                ],
+            )
+            .unwrap_or(false),
+            encryption: option_string(request, &["encrypt", "encryption", "sslMode"]).and_then(
+                |value| match value.trim().to_ascii_lowercase().as_str() {
+                    "required" | "require" | "strict" | "true" | "yes" => {
+                        Some(EncryptionLevel::Required)
+                    }
+                    "on" | "prefer" | "preferred" => Some(EncryptionLevel::On),
+                    // tiberius spells "encrypt the login only" as `Off`, which
+                    // reads like "no encryption" and is not. A user writing
+                    // `off` means no encryption, so that maps to NotSupported
+                    // and only the explicit spelling selects login-only.
+                    "login" | "loginonly" | "login-only" => Some(EncryptionLevel::Off),
+                    "disable" | "disabled" | "notsupported" | "none" | "false" | "no" | "off" => {
+                        Some(EncryptionLevel::NotSupported)
+                    }
+                    _ => None,
+                },
+            ),
+        }
+    }
+
+    /// Apply the trust settings to a config.
+    ///
+    /// `Err` rather than a panic when the profile asks for both a CA and blanket
+    /// trust: tiberius makes `trust_cert` and `trust_cert_ca` mutually exclusive
+    /// and enforces it with `panic!`, so calling both would take the host down
+    /// rather than return a message. `from_ado_string` can have set the CA
+    /// already, which is how the previous unconditional `trust_cert()` crashed
+    /// on exactly the connection strings that named a private CA.
+    fn apply(&self, config: &mut Config, ado_names_ca: bool) -> Result<(), String> {
+        if let Some(encryption) = self.encryption {
+            config.encryption(encryption);
+        }
+
+        match (&self.ca_path, self.accept_invalid_certs, ado_names_ca) {
+            (Some(_), true, _) | (None, true, true) => Err(
+                "the profile both names a certificate authority and asks to accept any \
+                 certificate. Choose one: drop the CA to accept anything, or drop the \
+                 insecure option to verify against the CA."
+                    .to_string(),
+            ),
+            // The connection string already pointed tiberius at a CA; touching
+            // trust again from here is what panicked.
+            (None, false, true) => Ok(()),
+            (Some(path), false, _) => {
+                if !std::path::Path::new(path).exists() {
+                    return Err(format!(
+                        "the certificate authority file at {path} does not exist."
+                    ));
+                }
+                config.trust_cert_ca(path);
+                Ok(())
+            }
+            (None, true, false) => {
+                config.trust_cert();
+                Ok(())
+            }
+            // The default: verify against the system trust store. Azure SQL
+            // presents a publicly trusted certificate, so this is what the
+            // common deployment wants and previously could not have.
+            (None, false, false) => Ok(()),
+        }
+    }
+}
+
+/// Whether an ADO connection string points tiberius at a CA file.
+///
+/// Read here rather than inferred, because the consequence of getting it wrong
+/// is a panic rather than a bad connection.
+fn ado_names_ca(ado: Option<&str>) -> bool {
+    ado.is_some_and(|ado| {
+        ado.split(';').any(|pair| {
+            pair.split_once('=').is_some_and(|(key, value)| {
+                key.trim().eq_ignore_ascii_case("trustservercertificateca")
+                    && !value.trim().is_empty()
+            })
+        })
+    })
+}
+
 impl SqlServerConfig {
     fn from_request(request: &Value) -> Result<Self, String> {
         let ado = option_string(request, &["connectionString", "url", "dsn"]);
@@ -259,6 +381,7 @@ impl SqlServerConfig {
                 "token",
             ],
         );
+        let tls = TlsTrust::from_request(request);
         let mut redaction_values = Vec::new();
         push_sensitive(&mut redaction_values, access_token.as_deref());
         push_sensitive(&mut redaction_values, password.as_deref());
@@ -270,6 +393,7 @@ impl SqlServerConfig {
             database,
             user,
             password,
+            tls,
             access_token,
             redaction_values,
         })
@@ -298,7 +422,8 @@ impl SqlServerConfig {
             }
             config
         };
-        config.trust_cert();
+        self.tls
+            .apply(&mut config, ado_names_ca(self.ado.as_deref()))?;
         Ok(config)
     }
 
@@ -720,5 +845,147 @@ mod tests {
         let redacted = config.redact("cannot open Server=sql.local;User Id=sa;Password=pw");
         assert!(redacted.contains("<sqlserver-connection>"), "{redacted}");
         assert!(!redacted.contains("Password=pw"), "{redacted}");
+    }
+
+    #[test]
+    fn verification_is_on_unless_the_profile_turns_it_off() {
+        // The connector used to call `trust_cert()` unconditionally, so every
+        // connection accepted any certificate and no option could change it.
+        let trust = TlsTrust::from_request(&json!({ "profile": { "host": "db.example" } }));
+        assert!(!trust.accept_invalid_certs);
+        assert_eq!(trust.ca_path, None);
+        assert_eq!(trust.encryption, None);
+    }
+
+    #[test]
+    fn the_insecure_option_is_spelled_the_same_as_in_every_other_connector() {
+        for field in [
+            "sslInsecure",
+            "tlsInsecure",
+            "trustServerCertificate",
+            "acceptInvalidCerts",
+        ] {
+            let trust =
+                TlsTrust::from_request(&json!({ "profile": { "options": { field: "true" } } }));
+            assert!(trust.accept_invalid_certs, "{field}");
+        }
+    }
+
+    #[test]
+    fn a_certificate_authority_is_read_under_each_spelling() {
+        for field in [
+            "sslRootCert",
+            "tlsCaCertificate",
+            "caCertificate",
+            "trustServerCertificateCa",
+        ] {
+            let trust = TlsTrust::from_request(&json!({
+                "profile": { "options": { field: "/etc/ssl/private-ca.pem" } }
+            }));
+            assert_eq!(
+                trust.ca_path.as_deref(),
+                Some("/etc/ssl/private-ca.pem"),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn asking_for_both_a_ca_and_blanket_trust_is_refused_rather_than_guessed() {
+        let trust = TlsTrust {
+            ca_path: Some("/etc/ssl/ca.pem".into()),
+            accept_invalid_certs: true,
+            encryption: None,
+        };
+        let mut config = Config::new();
+        let err = trust.apply(&mut config, false).unwrap_err();
+        assert!(err.contains("Choose one"), "{err}");
+    }
+
+    #[test]
+    fn a_connection_string_naming_a_ca_is_left_alone() {
+        // This is the case that used to panic. tiberius makes `trust_cert` and
+        // `trust_cert_ca` mutually exclusive and enforces it with `panic!`, and
+        // `from_ado_string` sets the CA when the string carries
+        // `TrustServerCertificateCA=` -- so the old unconditional
+        // `trust_cert()` took the host down on exactly the careful profiles.
+        let trust = TlsTrust::default();
+        let mut config = Config::new();
+        assert!(trust.apply(&mut config, true).is_ok());
+    }
+
+    #[test]
+    fn a_connection_string_ca_plus_an_insecure_option_is_refused_not_panicked() {
+        let trust = TlsTrust {
+            ca_path: None,
+            accept_invalid_certs: true,
+            encryption: None,
+        };
+        let mut config = Config::new();
+        let err = trust.apply(&mut config, true).unwrap_err();
+        assert!(err.contains("Choose one"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_certificate_authority_file_is_reported_before_connecting() {
+        let trust = TlsTrust {
+            ca_path: Some("/nonexistent/ca.pem".into()),
+            accept_invalid_certs: false,
+            encryption: None,
+        };
+        let mut config = Config::new();
+        let err = trust.apply(&mut config, false).unwrap_err();
+        assert!(err.contains("/nonexistent/ca.pem"), "{err}");
+        assert!(err.contains("does not exist"), "{err}");
+    }
+
+    #[test]
+    fn ado_strings_are_scanned_for_a_named_certificate_authority() {
+        assert!(ado_names_ca(Some(
+            "Server=db;TrustServerCertificateCA=/etc/ssl/ca.pem;Database=app"
+        )));
+        assert!(ado_names_ca(Some(
+            "Server=db;trustservercertificateca = /etc/ssl/ca.pem"
+        )));
+        assert!(!ado_names_ca(Some("Server=db;TrustServerCertificate=true")));
+        assert!(!ado_names_ca(Some(
+            "Server=db;TrustServerCertificateCA=;Database=app"
+        )));
+        assert!(!ado_names_ca(None));
+    }
+
+    #[test]
+    fn encryption_levels_map_from_the_words_a_user_would_write() {
+        let level = |value: &str| {
+            TlsTrust::from_request(&json!({ "profile": { "options": { "encrypt": value } } }))
+                .encryption
+        };
+        assert_eq!(level("required"), Some(EncryptionLevel::Required));
+        assert_eq!(level("true"), Some(EncryptionLevel::Required));
+        assert_eq!(level("prefer"), Some(EncryptionLevel::On));
+        // tiberius spells "encrypt the login only" as `Off`; a user writing
+        // `off` means no encryption, so the two must not be conflated.
+        assert_eq!(level("off"), Some(EncryptionLevel::NotSupported));
+        assert_eq!(level("loginOnly"), Some(EncryptionLevel::Off));
+        assert_eq!(level("nonsense"), None);
+    }
+
+    #[test]
+    fn a_real_ado_config_naming_a_ca_survives_the_trust_settings() {
+        // The regression itself, and it was verified by restoring the old line
+        // here: `from_ado_string` puts the config into
+        // `TrustConfig::CaCertificateLocation`, and the old unconditional
+        // `config.trust_cert()` then hit tiberius's own
+        // `'trust_cert' and 'trust_cert_ca' are mutual exclusive!` panic. So
+        // naming a private CA -- the careful configuration -- took the host
+        // process down, while `TrustServerCertificate=true` worked fine.
+        let ado = "Server=tcp:db.example,1433;Database=app;\
+                   User Id=sa;Password=pw;TrustServerCertificateCA=/etc/ssl/ca.pem";
+        let mut config = Config::from_ado_string(ado).expect("ado string");
+        let trust = TlsTrust::from_request(&json!({ "profile": { "url": ado } }));
+        assert!(
+            trust.apply(&mut config, ado_names_ca(Some(ado))).is_ok(),
+            "a connection string naming a CA must not be touched again"
+        );
     }
 }
