@@ -1,3 +1,4 @@
+use irodori_connector_abi::{option_string, push_sensitive};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -603,55 +604,6 @@ fn connection(connection_id: &str) -> Result<SqlServerConnection, IrodoriConnect
             format!("no open connection: {connection_id}"),
         )
     })
-}
-
-fn request_containers(request: &Value) -> Vec<&Value> {
-    [
-        Some(request),
-        request.get("profile"),
-        request.get("options"),
-        request.get("auth"),
-        request.get("secrets"),
-        request
-            .get("profile")
-            .and_then(|profile| profile.get("options")),
-        request
-            .get("profile")
-            .and_then(|profile| profile.get("auth")),
-        request
-            .get("profile")
-            .and_then(|profile| profile.get("secrets")),
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
-}
-
-fn option_string(request: &Value, fields: &[&str]) -> Option<String> {
-    request_containers(request)
-        .into_iter()
-        .find_map(|container| {
-            fields.iter().find_map(|field| {
-                container
-                    .get(*field)
-                    .map(|value| match value {
-                        Value::String(value) => value.clone(),
-                        Value::Number(value) => value.to_string(),
-                        Value::Bool(value) => value.to_string(),
-                        _ => String::new(),
-                    })
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty())
-            })
-        })
-}
-
-fn push_sensitive(values: &mut Vec<String>, value: Option<&str>) {
-    if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
-        if !values.iter().any(|existing| existing == value) {
-            values.push(value.to_string());
-        }
-    }
 }
 
 fn host_from_ado(ado: Option<&str>) -> Option<String> {
