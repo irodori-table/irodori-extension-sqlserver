@@ -428,24 +428,12 @@ impl SqlServerConfig {
     }
 
     fn redact(&self, message: &str) -> String {
-        // `str::replace` with an empty needle inserts the replacement between
-        // every character, so a profile configured by host and port — which has
-        // no ADO string — turned every error message into
-        // `<sqlserver-connection>l<sqlserver-connection>o…`. The loop below
-        // already guarded against an empty secret; this one was missed.
-        let message = match self.ado.as_deref().filter(|ado| !ado.is_empty()) {
-            Some(ado) => message.replace(ado, "<sqlserver-connection>"),
-            None => message.to_string(),
-        };
-        self.redaction_values
-            .iter()
-            .fold(message, |message, secret| {
-                if secret.is_empty() {
-                    message
-                } else {
-                    message.replace(secret, "****")
-                }
-            })
+        abi::redact_endpoint(
+            message,
+            self.ado.as_deref().unwrap_or_default(),
+            "<sqlserver-connection>",
+            &self.redaction_values,
+        )
     }
 }
 
@@ -626,7 +614,7 @@ fn column_data_to_json(data: &ColumnData<'static>) -> Value {
             value.map_or(Value::Null, |value| Value::String(value.to_string()))
         }
         ColumnData::Binary(value) => value.as_ref().map_or(Value::Null, |value| {
-            Value::String(format!("\\x{}", hex_encode(value)))
+            Value::String(format!("\\x{}", abi::hex_encode(value)))
         }),
         ColumnData::Numeric(value) => value.map_or(Value::Null, |value| {
             Value::String(numeric_to_string(value.value(), value.scale()))
@@ -685,16 +673,6 @@ fn numeric_to_string(value: i128, scale: u8) -> String {
     let (int_part, frac_part) = padded.split_at(point);
     let sign = if value < 0 { "-" } else { "" };
     format!("{sign}{int_part}.{frac_part}")
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
 }
 
 fn get_str(row: &tiberius::Row, index: usize) -> String {
