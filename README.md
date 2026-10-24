@@ -16,7 +16,7 @@ This crate packages the connector metadata, native ABI exports, and driver imple
 - Native ABI: `irodori.connector.native.v1`
 - Driver linked: `yes`
 - Marketplace visibility: `public`
-- Package version: `0.1.4`
+- Package version: `0.1.8`
 
 The package includes a desktop adapter source snapshot from `db/mssql.rs`.
 
