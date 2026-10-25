@@ -368,8 +368,8 @@ dependencies = [
 
 [[package]]
 name = "irodori-connector-abi"
-version = "0.9.3"
-source = "git+https://github.com/irodori-table/irodori-kit?tag=v0.9.3#1ebdaab75574b15fe41dbb14458c674cb4a40baa"
+version = "0.9.4"
+source = "git+https://github.com/irodori-table/irodori-kit?tag=v0.9.4#d9452d00095a4bc5c346036466b8831c21e4313f"
 dependencies = [
  "serde_json",
 ]
