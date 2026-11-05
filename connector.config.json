@@ -294,7 +294,13 @@
           "label": "Managed identity",
           "kind": "managedIdentity",
           "secretPurposes": [],
-          "fields": []
+          "fields": [
+            {
+              "id": "managedIdentityClientId",
+              "label": "Client ID (user-assigned identity)",
+              "type": "string"
+            }
+          ]
         },
         {
           "id": "accessToken",
@@ -786,7 +792,13 @@
         "label": "Managed identity",
         "kind": "managedIdentity",
         "secretPurposes": [],
-        "fields": []
+        "fields": [
+          {
+            "id": "managedIdentityClientId",
+            "label": "Client ID (user-assigned identity)",
+            "type": "string"
+          }
+        ]
       },
       {
         "id": "accessToken",
