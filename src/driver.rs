@@ -1,8 +1,10 @@
-use irodori_connector_abi::{option_bool, option_string, push_sensitive};
+use irodori_connector_abi::{option_bool, option_string, percent_encode, push_sensitive};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use futures_util::TryStreamExt;
+use reqwest::Client as HttpClient;
 use serde_json::{json, Map, Value};
 use tiberius::time::chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
 use tiberius::{AuthMethod, Client, ColumnData, Config, EncryptionLevel, FromSql, QueryItem};
@@ -36,6 +38,8 @@ struct SqlServerConfig {
     /// A Microsoft Entra (Azure AD) access token, when the profile supplies one
     /// instead of a SQL login.
     access_token: Option<String>,
+    /// A credential to exchange for `access_token` when connecting.
+    entra: Option<EntraCredential>,
     tls: TlsTrust,
     redaction_values: Vec<String>,
 }
@@ -112,11 +116,12 @@ fn connect(request: &Value) -> IrodoriConnectorBuffer {
         Ok(config) => config,
         Err(err) => return abi::error("connector.invalidRequest", err),
     };
-    let connection =
-        match runtime().and_then(|runtime| runtime.block_on(SqlServerConnection::new(config))) {
-            Ok(connection) => connection,
-            Err(err) => return abi::error("connector.connectFailed", err),
-        };
+    let connection = match runtime().and_then(|runtime| {
+        runtime.block_on(async { SqlServerConnection::new(config.with_entra_token().await?).await })
+    }) {
+        Ok(connection) => connection,
+        Err(err) => return abi::error("connector.connectFailed", err),
+    };
     let version = match runtime().and_then(|runtime| runtime.block_on(load_version(&connection))) {
         Ok(version) => version,
         Err(err) => return abi::error("connector.connectFailed", connection.config.redact(&err)),
@@ -357,7 +362,320 @@ fn ado_names_ca(ado: Option<&str>) -> bool {
     })
 }
 
+/// The scope a SQL Server access token has to be issued for.
+///
+/// Entra will happily issue a token for the wrong audience, and SQL Server will
+/// reject it with a login failure that says nothing about the audience, so this
+/// is not somewhere to accept a user-supplied value.
+const SQL_SCOPE: &str = "https://database.windows.net/.default";
+const SQL_RESOURCE: &str = "https://database.windows.net/";
+const ENTRA_AUTHORITY: &str = "https://login.microsoftonline.com";
+
+/// Outside Azure the managed identity address usually swallows packets rather
+/// than refusing them, so without a limit a connection attempt would sit there
+/// until the operating system gave up.
+const TOKEN_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+const TENANT_ID_FIELDS: &[&str] = &["tenantId", "azureTenantId", "tenant"];
+const CLIENT_ID_FIELDS: &[&str] = &["clientId", "azureClientId", "applicationId"];
+const CLIENT_SECRET_FIELDS: &[&str] = &[
+    "clientSecret",
+    "azureClientSecret",
+    "servicePrincipalSecret",
+];
+
+/// How the profile wants a Microsoft Entra token obtained.
+///
+/// The connector already accepted a token someone else had minted. That is the
+/// least useful form: an access token lives about an hour, so a saved
+/// connection stops working overnight. These two acquire one at connect time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EntraCredential {
+    /// A service principal's client id and secret.
+    ClientSecret {
+        tenant_id: String,
+        client_id: String,
+        client_secret: String,
+    },
+    /// The identity the host itself runs as, from the platform's token
+    /// endpoint. `client_id` selects a user-assigned identity; without it the
+    /// system-assigned one is used.
+    ManagedIdentity { client_id: Option<String> },
+}
+
+impl EntraCredential {
+    /// `None` when the profile asks for neither.
+    ///
+    /// The connection form says which method it collected fields for, and that
+    /// is the only way to tell a managed identity was chosen: the method has no
+    /// required field to recognise it by.
+    fn from_request(request: &Value) -> Result<Option<Self>, String> {
+        match option_string(request, &["authMethod"]).as_deref() {
+            Some("managedIdentity") => Ok(Some(Self::managed_identity(request))),
+            Some("servicePrincipal") => Self::client_secret(request).map(Some),
+            Some("azureAd") => Self::client_secret(request)
+                .map(Some)
+                .map_err(|err| format!("{err} An access token works instead.")),
+            // Hand-written options have no picker, so the values are all there
+            // is to go on.
+            None | Some("customDriverOptions") => Self::from_values(request),
+            // Any other method is not Entra, whatever else the profile holds.
+            Some(_) => Ok(None),
+        }
+    }
+
+    fn from_values(request: &Value) -> Result<Option<Self>, String> {
+        if option_bool(request, &["managedIdentity", "useManagedIdentity", "msi"]) == Some(true) {
+            return Ok(Some(Self::managed_identity(request)));
+        }
+        let names_a_principal = [TENANT_ID_FIELDS, CLIENT_ID_FIELDS, CLIENT_SECRET_FIELDS]
+            .iter()
+            .any(|fields| option_string(request, fields).is_some());
+        if names_a_principal {
+            Self::client_secret(request).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn managed_identity(request: &Value) -> Self {
+        Self::ManagedIdentity {
+            client_id: option_string(
+                request,
+                &[
+                    "managedIdentityClientId",
+                    "userAssignedClientId",
+                    "msiClientId",
+                ],
+            ),
+        }
+    }
+
+    /// `Err` names what is missing: the alternative is falling through to an
+    /// empty SQL login and reporting a failure the user cannot explain.
+    fn client_secret(request: &Value) -> Result<Self, String> {
+        match (
+            option_string(request, TENANT_ID_FIELDS),
+            option_string(request, CLIENT_ID_FIELDS),
+            option_string(request, CLIENT_SECRET_FIELDS),
+        ) {
+            (Some(tenant_id), Some(client_id), Some(client_secret)) => Ok(Self::ClientSecret {
+                tenant_id,
+                client_id,
+                client_secret,
+            }),
+            (tenant_id, client_id, client_secret) => {
+                let missing = [
+                    (tenant_id.is_none(), "tenantId"),
+                    (client_id.is_none(), "clientId"),
+                    (client_secret.is_none(), "clientSecret"),
+                ]
+                .iter()
+                .filter(|(absent, _)| *absent)
+                .map(|(_, name)| *name)
+                .collect::<Vec<_>>();
+                Err(format!(
+                    "Entra service principal authentication is missing {}.",
+                    missing.join(", ")
+                ))
+            }
+        }
+    }
+
+    async fn fetch_token(&self) -> Result<String, String> {
+        match self {
+            Self::ClientSecret {
+                tenant_id,
+                client_id,
+                client_secret,
+            } => {
+                client_credentials_token(
+                    &token_client(true)?,
+                    ENTRA_AUTHORITY,
+                    tenant_id,
+                    client_id,
+                    client_secret,
+                )
+                .await
+            }
+            Self::ManagedIdentity { client_id } => {
+                let (url, headers) = managed_identity_endpoint(client_id.as_deref());
+                managed_identity_token(&url, &headers).await
+            }
+        }
+    }
+}
+
+/// Redirects stay off because a token request carries the credential.
+fn token_client(use_proxy: bool) -> Result<HttpClient, String> {
+    let builder = HttpClient::builder()
+        .connect_timeout(TOKEN_CONNECT_TIMEOUT)
+        .timeout(TOKEN_REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none());
+    let builder = if use_proxy {
+        builder
+    } else {
+        builder.no_proxy()
+    };
+    builder
+        .build()
+        .map_err(|err| format!("the token request could not be prepared: {err}"))
+}
+
+/// Only the kind of failure: a request error quotes the URL.
+fn request_failure(err: &reqwest::Error) -> &'static str {
+    if err.is_timeout() {
+        "timed out"
+    } else if err.is_connect() {
+        "could not connect"
+    } else {
+        "failed"
+    }
+}
+
+async fn client_credentials_token(
+    client: &HttpClient,
+    authority: &str,
+    tenant_id: &str,
+    client_id: &str,
+    client_secret: &str,
+) -> Result<String, String> {
+    let url = format!(
+        "{authority}/{}/oauth2/v2.0/token",
+        percent_encode(tenant_id)
+    );
+    let body = format!(
+        "grant_type=client_credentials&client_id={}&client_secret={}&scope={}",
+        percent_encode(client_id),
+        percent_encode(client_secret),
+        percent_encode(SQL_SCOPE)
+    );
+    let response = client
+        .post(url)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await
+        .map_err(|err| format!("the Entra token request {}.", request_failure(&err)))?;
+    read_token(response, "Entra").await
+}
+
+async fn managed_identity_token(url: &str, headers: &[(String, String)]) -> Result<String, String> {
+    // The endpoint is local to the host, and a proxy cannot reach it.
+    let client = token_client(false)?;
+    let mut request = client.get(url);
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    let response = request.send().await.map_err(|err| {
+        format!(
+            "the managed identity token request {}. This works only where a managed \
+             identity is available: an Azure VM, App Service, Container App, or AKS pod.",
+            request_failure(&err)
+        )
+    })?;
+    read_token(response, "the managed identity endpoint").await
+}
+
+/// Where to ask for a managed identity token, and what to send with the ask.
+///
+/// Two shapes exist. App Service, Functions and Container Apps inject
+/// `IDENTITY_ENDPOINT` and a secret in `IDENTITY_HEADER`; a plain VM or AKS
+/// node has neither and answers on the IMDS link-local address instead. Trying
+/// the injected one first is what every Azure SDK does, because on App Service
+/// the IMDS address is not routable at all.
+fn managed_identity_endpoint(client_id: Option<&str>) -> (String, Vec<(String, String)>) {
+    managed_identity_endpoint_from(
+        std::env::var("IDENTITY_ENDPOINT").ok().as_deref(),
+        std::env::var("IDENTITY_HEADER").ok().as_deref(),
+        client_id,
+    )
+}
+
+/// The choice itself, with the environment passed in, so it can be tested
+/// without `set_var` racing under the parallel test runner.
+fn managed_identity_endpoint_from(
+    identity_endpoint: Option<&str>,
+    identity_header: Option<&str>,
+    client_id: Option<&str>,
+) -> (String, Vec<(String, String)>) {
+    let user_assigned = client_id
+        .map(|id| format!("&client_id={}", percent_encode(id)))
+        .unwrap_or_default();
+
+    // Both or neither: sending no header to the injected endpoint returns 401,
+    // which reads as a permissions problem rather than a configuration one.
+    if let (Some(endpoint), Some(secret)) = (identity_endpoint, identity_header) {
+        let url = format!(
+            "{endpoint}?api-version=2019-08-01&resource={}{user_assigned}",
+            percent_encode(SQL_RESOURCE)
+        );
+        return (
+            url,
+            vec![("X-IDENTITY-HEADER".to_string(), secret.to_string())],
+        );
+    }
+
+    let url = format!(
+        "http://169.254.169.254/metadata/identity/oauth2/token\
+         ?api-version=2018-02-01&resource={}{user_assigned}",
+        percent_encode(SQL_RESOURCE)
+    );
+    (url, vec![("Metadata".to_string(), "true".to_string())])
+}
+
+/// Pull a token out of a token response.
+///
+/// The body is never quoted back: a failed Entra token response includes the
+/// tenant and client id, and on some errors the assertion that was sent. The
+/// error *code* is safe and is what identifies the problem.
+async fn read_token(response: reqwest::Response, who: &str) -> Result<String, String> {
+    let status = response.status();
+    let text = response.text().await.map_err(|err| {
+        format!(
+            "reading the token response from {who} {}.",
+            request_failure(&err)
+        )
+    })?;
+    let body = serde_json::from_str::<Value>(&text).ok();
+    if !status.is_success() {
+        let code = body
+            .as_ref()
+            .and_then(|value| value.get("error"))
+            .and_then(Value::as_str)
+            .map(|code| format!(" ({code})"))
+            .unwrap_or_default();
+        return Err(format!(
+            "{who} returned HTTP {status}{code} for the token request."
+        ));
+    }
+    body.as_ref()
+        .and_then(|value| value.get("access_token"))
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("the token response from {who} contained no access_token."))
+}
+
 impl SqlServerConfig {
+    /// Exchange a configured credential for the token the login will use.
+    ///
+    /// Separate from reading the profile, because an identity provider that
+    /// cannot be reached is a failure to connect, not a bad request.
+    async fn with_entra_token(mut self) -> Result<Self, String> {
+        let Some(credential) = self.entra.take() else {
+            return Ok(self);
+        };
+        let token = credential
+            .fetch_token()
+            .await
+            .map_err(|err| self.redact(&err))?;
+        push_sensitive(&mut self.redaction_values, Some(&token));
+        self.access_token = Some(token);
+        Ok(self)
+    }
+
     fn from_request(request: &Value) -> Result<Self, String> {
         let ado = option_string(request, &["connectionString", "url", "dsn"]);
         let host = option_string(request, &["host", "server"])
@@ -368,9 +686,9 @@ impl SqlServerConfig {
         let database = option_string(request, &["database", "db"]);
         let user = option_string(request, &["user", "username", "uid"]);
         let password = option_string(request, &["password", "pwd", "token"]);
-        // Every Entra path — interactive login, a service principal, a managed
-        // identity — ends in a token. Accepting the token itself is the part
-        // this connector can honour without an Azure identity client.
+        // Every Entra path ends in a token, so the rest of the driver only ever
+        // sees one. An explicitly supplied token wins over a credential: it is
+        // the more specific instruction.
         let access_token = option_string(
             request,
             &[
@@ -381,10 +699,17 @@ impl SqlServerConfig {
                 "token",
             ],
         );
+        let entra = match access_token {
+            Some(_) => None,
+            None => EntraCredential::from_request(request)?,
+        };
         let tls = TlsTrust::from_request(request);
         let mut redaction_values = Vec::new();
         push_sensitive(&mut redaction_values, access_token.as_deref());
         push_sensitive(&mut redaction_values, password.as_deref());
+        if let Some(EntraCredential::ClientSecret { client_secret, .. }) = &entra {
+            push_sensitive(&mut redaction_values, Some(client_secret));
+        }
         collect_ado_secrets(ado.as_deref().unwrap_or_default(), &mut redaction_values);
         Ok(Self {
             ado,
@@ -395,6 +720,7 @@ impl SqlServerConfig {
             password,
             tls,
             access_token,
+            entra,
             redaction_values,
         })
     }
@@ -406,22 +732,21 @@ impl SqlServerConfig {
             let mut config = Config::new();
             config.host(&self.host);
             config.port(self.port);
-            // An Entra token identifies a user or service principal that SQL
-            // Server trusts directly, so it replaces the SQL login rather than
-            // supplementing it. Preferred when present: supplying both and
-            // silently using the password would authenticate as somebody else.
-            match self.access_token.as_deref() {
-                Some(token) => config.authentication(AuthMethod::AADToken(token.to_string())),
-                None => config.authentication(AuthMethod::sql_server(
-                    self.user.clone().unwrap_or_default(),
-                    self.password.clone().unwrap_or_default(),
-                )),
-            }
+            config.authentication(AuthMethod::sql_server(
+                self.user.clone().unwrap_or_default(),
+                self.password.clone().unwrap_or_default(),
+            ));
             if let Some(database) = self.database.as_deref() {
                 config.database(database);
             }
             config
         };
+        // An Entra token identifies a user or service principal that SQL Server
+        // trusts directly, so it replaces any other login, a connection string's
+        // included: using the other one would authenticate as somebody else.
+        if let Some(token) = self.access_token.as_deref() {
+            config.authentication(AuthMethod::AADToken(token.to_string()));
+        }
         self.tls
             .apply(&mut config, ado_names_ca(self.ado.as_deref()))?;
         Ok(config)
@@ -965,5 +1290,337 @@ mod tests {
             trust.apply(&mut config, ado_names_ca(Some(ado))).is_ok(),
             "a connection string naming a CA must not be touched again"
         );
+    }
+
+    /// What the connection form sends: the chosen method under
+    /// `options.authMethod`, and only that method's declared fields.
+    fn form_request(options: Value) -> Value {
+        json!({ "profile": { "host": "sql.local", "options": options } })
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        runtime().expect("runtime").block_on(future)
+    }
+
+    /// Answer one HTTP request, returning its address and what it received.
+    fn one_shot_server(status: &str, body: &str) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = format!("http://{}", listener.local_addr().expect("address"));
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut received = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).expect("read");
+                received.extend_from_slice(&chunk[..read]);
+                let text = String::from_utf8_lossy(&received).into_owned();
+                let complete = text.split_once("\r\n\r\n").is_some_and(|(head, body)| {
+                    let expected = head.lines().find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    });
+                    body.len() >= expected.unwrap_or(0)
+                });
+                if complete || read == 0 {
+                    break;
+                }
+            }
+            stream.write_all(response.as_bytes()).expect("write");
+            sender
+                .send(String::from_utf8_lossy(&received).into_owned())
+                .expect("send");
+        });
+        (address, receiver)
+    }
+
+    #[test]
+    fn choosing_managed_identity_in_the_form_needs_no_other_field() {
+        // The method declares nothing required, so `authMethod` is the only
+        // thing that distinguishes it from an empty SQL login.
+        assert_eq!(
+            EntraCredential::from_request(&form_request(json!({
+                "authMethod": "managedIdentity"
+            })))
+            .unwrap(),
+            Some(EntraCredential::ManagedIdentity { client_id: None })
+        );
+    }
+
+    #[test]
+    fn every_field_the_form_declares_for_an_entra_method_is_read() {
+        // The fields come from the manifest the form is built from, so a
+        // binding that drifts from the driver fails here rather than at login.
+        let config: Value = serde_json::from_str(CONFIG_JSON).expect("config");
+        let form_values = |method: &str| {
+            let declared = config["connection"]["authMethods"]
+                .as_array()
+                .expect("methods")
+                .iter()
+                .find(|candidate| candidate["id"] == method)
+                .expect("method");
+            let mut options = Map::from_iter([("authMethod".to_string(), json!(method))]);
+            for field in declared["fields"].as_array().expect("fields") {
+                let id = field["id"].as_str().expect("id");
+                if id != "accessToken" {
+                    options.insert(id.to_string(), json!(format!("value-of-{id}")));
+                }
+            }
+            form_request(Value::Object(options))
+        };
+        let principal = EntraCredential::ClientSecret {
+            tenant_id: "value-of-tenantId".into(),
+            client_id: "value-of-clientId".into(),
+            client_secret: "value-of-clientSecret".into(),
+        };
+
+        for method in ["servicePrincipal", "azureAd"] {
+            assert_eq!(
+                EntraCredential::from_request(&form_values(method)).unwrap(),
+                Some(principal.clone()),
+                "{method}"
+            );
+        }
+        assert_eq!(
+            EntraCredential::from_request(&form_values("managedIdentity")).unwrap(),
+            Some(EntraCredential::ManagedIdentity {
+                client_id: Some("value-of-managedIdentityClientId".into())
+            })
+        );
+    }
+
+    #[test]
+    fn another_method_is_not_redirected_by_leftover_entra_values() {
+        let config = SqlServerConfig::from_request(&form_request(json!({
+            "authMethod": "sqlPassword",
+            "tenantId": "t",
+            "clientId": "c",
+            "managedIdentity": true
+        })))
+        .expect("config");
+        assert_eq!(config.entra, None);
+    }
+
+    #[test]
+    fn an_incomplete_service_principal_names_what_is_missing() {
+        let err = SqlServerConfig::from_request(&form_request(json!({
+            "authMethod": "servicePrincipal",
+            "clientId": "app-id"
+        })))
+        .unwrap_err();
+        assert!(err.contains("tenantId, clientSecret"), "{err}");
+        assert!(!err.contains("clientId"), "{err}");
+    }
+
+    #[test]
+    fn azure_ad_takes_an_access_token_instead_of_a_principal() {
+        let config = SqlServerConfig::from_request(&form_request(json!({
+            "authMethod": "azureAd",
+            "accessToken": "eyJ0oken"
+        })))
+        .expect("config");
+        assert_eq!(config.access_token.as_deref(), Some("eyJ0oken"));
+        assert_eq!(config.entra, None);
+
+        let err = SqlServerConfig::from_request(&form_request(json!({
+            "authMethod": "azureAd"
+        })))
+        .unwrap_err();
+        assert!(err.contains("An access token works instead"), "{err}");
+    }
+
+    #[test]
+    fn hand_written_options_are_recognised_under_each_spelling() {
+        for (tenant, client, secret) in [
+            ("tenantId", "clientId", "clientSecret"),
+            ("azureTenantId", "azureClientId", "azureClientSecret"),
+        ] {
+            assert_eq!(
+                EntraCredential::from_request(&form_request(json!({
+                    tenant: "contoso.onmicrosoft.com",
+                    client: "app-id",
+                    secret: "shh"
+                })))
+                .unwrap(),
+                Some(EntraCredential::ClientSecret {
+                    tenant_id: "contoso.onmicrosoft.com".into(),
+                    client_id: "app-id".into(),
+                    client_secret: "shh".into(),
+                })
+            );
+        }
+        assert_eq!(
+            EntraCredential::from_request(&form_request(json!({}))).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_managed_identity_flag_accepts_a_string_and_beats_a_stale_principal() {
+        // A form submits "true", not a JSON boolean; both sets of fields can
+        // survive in a profile the user edited, and the flag is the later intent.
+        assert_eq!(
+            EntraCredential::from_request(&form_request(json!({
+                "useManagedIdentity": "true",
+                "tenantId": "t", "clientId": "c", "clientSecret": "s"
+            })))
+            .unwrap(),
+            Some(EntraCredential::ManagedIdentity { client_id: None })
+        );
+    }
+
+    #[test]
+    fn the_client_secret_is_redacted_from_errors() {
+        let config = SqlServerConfig::from_request(&form_request(json!({
+            "authMethod": "servicePrincipal",
+            "tenantId": "t", "clientId": "c", "clientSecret": "sh-h-secret"
+        })))
+        .expect("config");
+        assert!(!config.redact("failed: sh-h-secret").contains("sh-h-secret"));
+    }
+
+    #[test]
+    fn a_token_replaces_the_login_of_a_connection_string() {
+        // A token that was asked for and then ignored would sign in as whoever
+        // the connection string names instead.
+        let config = SqlServerConfig::from_request(&form_request(json!({
+            "connectionString": "Server=sql.local;User Id=sa;Password=pw",
+            "accessToken": "eyJ0oken"
+        })))
+        .expect("config");
+        let tds = format!("{:?}", config.tds_config().expect("tds config"));
+        assert!(tds.contains("AADToken"), "{tds}");
+    }
+
+    #[test]
+    fn a_sql_login_stays_a_sql_login() {
+        let config = SqlServerConfig::from_request(&form_request(json!({
+            "authMethod": "sqlPassword",
+            "user": "sa",
+            "password": "pw"
+        })))
+        .expect("config");
+        let tds = format!("{:?}", config.tds_config().expect("tds config"));
+        assert!(!tds.contains("AADToken"), "{tds}");
+    }
+
+    #[test]
+    fn the_imds_endpoint_is_used_when_nothing_is_injected() {
+        let (url, headers) = managed_identity_endpoint_from(None, None, None);
+        assert!(url.starts_with("http://169.254.169.254/"), "{url}");
+        assert!(
+            url.contains("resource=https%3A%2F%2Fdatabase.windows.net%2F"),
+            "{url}"
+        );
+        assert_eq!(headers, vec![("Metadata".to_string(), "true".to_string())]);
+    }
+
+    #[test]
+    fn an_injected_endpoint_without_its_header_falls_back_to_imds() {
+        let (url, _) =
+            managed_identity_endpoint_from(Some("http://127.0.0.1:42424/msi/token"), None, None);
+        assert!(url.starts_with("http://169.254.169.254/"), "{url}");
+    }
+
+    #[test]
+    fn a_user_assigned_client_id_is_encoded_into_the_query() {
+        let (url, _) = managed_identity_endpoint_from(None, None, Some("app/id with space"));
+        assert!(url.contains("&client_id=app%2Fid%20with%20space"), "{url}");
+    }
+
+    #[test]
+    fn a_managed_identity_token_comes_from_the_injected_endpoint() {
+        let (address, received) = one_shot_server("200 OK", r#"{"access_token":"minted"}"#);
+        let (url, headers) = managed_identity_endpoint_from(
+            Some(&format!("{address}/msi/token")),
+            Some("header-secret"),
+            Some("app-id"),
+        );
+
+        let token = block_on(managed_identity_token(&url, &headers)).expect("token");
+
+        assert_eq!(token, "minted");
+        let request = received.recv().expect("request").to_ascii_lowercase();
+        assert!(
+            request.starts_with(
+                "get /msi/token?api-version=2019-08-01\
+                 &resource=https%3a%2f%2fdatabase.windows.net%2f&client_id=app-id http/1.1"
+            ),
+            "{request}"
+        );
+        assert!(
+            request.contains("x-identity-header: header-secret"),
+            "{request}"
+        );
+    }
+
+    #[test]
+    fn a_client_secret_is_exchanged_for_a_token_scoped_to_sql() {
+        let (address, received) = one_shot_server("200 OK", r#"{"access_token":"minted"}"#);
+        let client = token_client(false).expect("client");
+
+        let token = block_on(client_credentials_token(
+            &client, &address, "contoso", "app-id", "s3cr&t",
+        ))
+        .expect("token");
+
+        assert_eq!(token, "minted");
+        let request = received.recv().expect("request");
+        assert!(
+            request.starts_with("POST /contoso/oauth2/v2.0/token HTTP/1.1"),
+            "{request}"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("application/x-www-form-urlencoded"),
+            "{request}"
+        );
+        for part in [
+            "grant_type=client_credentials",
+            "client_id=app-id",
+            "client_secret=s3cr%26t",
+            "scope=https%3A%2F%2Fdatabase.windows.net%2F.default",
+        ] {
+            assert!(request.contains(part), "{part}");
+        }
+    }
+
+    #[test]
+    fn a_refused_token_reports_its_code_but_not_the_response() {
+        let (address, _received) = one_shot_server(
+            "401 Unauthorized",
+            r#"{"error":"invalid_client","error_description":"AADSTS7000215 for tenant contoso"}"#,
+        );
+        let client = token_client(false).expect("client");
+
+        let err = block_on(client_credentials_token(
+            &client, &address, "contoso", "app-id", "shh",
+        ))
+        .unwrap_err();
+
+        assert!(err.contains("401"), "{err}");
+        assert!(err.contains("invalid_client"), "{err}");
+        assert!(!err.contains("AADSTS"), "{err}");
+        assert!(!err.contains("contoso"), "{err}");
+    }
+
+    #[test]
+    fn a_response_without_a_token_is_an_error() {
+        let (address, _received) = one_shot_server("200 OK", r#"{"token_type":"Bearer"}"#);
+        let (url, headers) =
+            managed_identity_endpoint_from(Some(&address), Some("header-secret"), None);
+
+        let err = block_on(managed_identity_token(&url, &headers)).unwrap_err();
+
+        assert!(err.contains("no access_token"), "{err}");
     }
 }
